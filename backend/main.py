@@ -1,6 +1,10 @@
 import json
 from functools import lru_cache
-
+import asyncio
+import uuid
+from llm import ask, ask_stream, chat_with_tools
+from ws_dispatcher import WSDispatcher, make_ws_confirm
+from tools.guard import guarded_exec
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -44,30 +48,6 @@ class ChatOut(BaseModel):
     reply: str
 
 
-# ---------- 调模型：两段小逻辑，HTTP 和 WS 各自调用 ----------
-async def ask(client: AsyncOpenAI, message: str) -> str:
-    """一次性问，等完整回复再返回。给 HTTP /chat 用。"""
-    resp = await client.chat.completions.create(
-        model=settings.deepseek_model,
-        messages=[{"role": "user", "content": message}],
-    )
-    return resp.choices[0].message.content
-
-
-async def ask_stream(client: AsyncOpenAI, message: str):
-    """流式问，逐块 yield 文本。给 WebSocket 用。"""
-    stream = await client.chat.completions.create(
-        model=settings.deepseek_model,
-        messages=[{"role": "user", "content": message}],
-        stream=True,
-    )
-    async for chunk in stream:
-        # chunk.choices[0].delta.content 是一小段文字，可能为 None
-        delta = chunk.choices[0].delta.content
-        if delta:
-            yield delta
-
-
 # ---------- 路由 ----------
 @app.get("/")
 def read_root():
@@ -93,37 +73,54 @@ async def ws_chat(
     client: AsyncOpenAI = Depends(get_client),
 ):
     """
-    WebSocket 版：前端主通道。
-    协议（JSON 字符串）：
-      前端 → 后端：
-        {"type": "chat", "content": "你好"}
-      后端 → 前端：
-        {"type": "delta", "content": "你"}   # 流式文字块，可能多条
-        {"type": "done"}                     # 本轮结束
+    WebSocket 主入口。
+    用 Dispatcher 统一管理消息收发。
     """
-    await ws.accept()  # 完成升级握手，返回 101
+    await ws.accept()
 
-    try:
-        while True:  # 保持连接，循环收消息
-            raw = await ws.receive_text()   # 等前端发一条
-            msg = json.loads(raw)
+    dispatcher = WSDispatcher(ws)
+    confirm_fn = await make_ws_confirm(dispatcher)
 
-            # 目前只处理 chat 类型，其他类型（以后的 tool_confirm）先忽略
-            if msg.get("type") != "chat":
-                continue
+    async def handle_chat(msg: dict):
+        """处理一条聊天消息"""
+        content = msg.get("content", "").strip()
 
-            message = msg.get("content", "")
+        # 测试触发：输入 /test_tool 走完整工具确认流程
+        if content == "/test_tool":
+            await run_tool_test(dispatcher, confirm_fn)
+            return
 
-            # 逐块把模型输出推给前端
-            async for delta in ask_stream(client, message):
-                await ws.send_text(json.dumps(
-                    {"type": "delta", "content": delta},
-                    ensure_ascii=False,  # 中文原样输出，不转成 \uXXXX
-                ))
+        # 走带工具的对话循环
+        async for chunk in chat_with_tools(client, content, confirm_fn):
+            await dispatcher.send({"type": "delta", "content": chunk})
+        await dispatcher.send({"type": "done"})
+    
+    # 关键：把处理函数挂上，然后启动 dispatcher
+    dispatcher.on_chat = handle_chat
+    await dispatcher.run()
 
-            # 本轮结束标记
-            await ws.send_text(json.dumps({"type": "done"}))
+async def run_tool_test(dispatcher: WSDispatcher, confirm_fn):
+    """
+    假工具调用：走一遍 guarded_exec 流程，把结果推给前端。
+    接入模型后，这段会被"从模型响应解析 tool_call"替代。
+    """
+    command = "touch /tmp/nian_ws_test"
 
-    except WebSocketDisconnect:
-        # 前端断开连接，正常退出，不打印异常
-        pass
+    await dispatcher.send({
+        "type": "delta",
+        "content": f"（测试）模型想执行：{command}\n",
+    })
+
+    result = await guarded_exec(command, confirm_fn)
+
+    await dispatcher.send({
+        "type": "tool_result",
+        "id": uuid.uuid4().hex,
+        "command": command,
+        **result,
+    })
+
+
+    await dispatcher.send({"type": "done"})
+
+    await dispatcher.send({"type": "done"})
