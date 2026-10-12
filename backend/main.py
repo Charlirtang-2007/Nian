@@ -2,6 +2,10 @@ import json
 from functools import lru_cache
 import asyncio
 import uuid
+from contextlib import asynccontextmanager
+from sqlalchemy import select
+from db import Base, SessionLocal, engine
+from models import Message
 from llm import ask, ask_stream, chat_with_tools
 from ws_dispatcher import WSDispatcher, make_ws_confirm
 from tools.guard import guarded_exec
@@ -11,7 +15,21 @@ from pydantic import BaseModel
 from openai import AsyncOpenAI
 from config import settings  # 引用配置类
 
-app = FastAPI()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    应用生命周期。
+
+    启动时：建表（如果表不存在）
+    关闭时：什么都不做
+    """
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    print("[db] tables ready")
+
+    yield  # 应用运行中
+
+app = FastAPI(lifespan=lifespan)
 
 # ---------- CORS 中间件 ----------
 # 允许本地 Vite dev server 跨域访问后端
@@ -47,6 +65,31 @@ class ChatOut(BaseModel):
     # 后端 HTTP 响应体，格式：{"reply": "..."}
     reply: str
 
+# ---------- 数据库辅助函数 ----------
+
+async def save_message(role: str, content: str):
+    """存一条消息到 messages 表"""
+    async with SessionLocal() as session:
+        session.add(Message(role=role, content=content))
+        await session.commit()
+
+
+async def load_recent_messages(limit: int = 50) -> list[dict]:
+    """
+    加载最近 limit 条消息，按时间正序返回。
+
+    [{"role": "user", "content": "..."}, ...]
+    """
+    async with SessionLocal() as session:
+        stmt = (
+            select(Message)
+            .order_by(Message.id.desc())
+            .limit(limit)
+        )
+        result = await session.execute(stmt)
+        rows = result.scalars().all()
+        rows = list(reversed(rows))
+        return [{"role": r.role, "content": r.content} for r in rows]
 
 # ---------- 路由 ----------
 @app.get("/")
@@ -77,6 +120,12 @@ async def ws_chat(
     用 Dispatcher 统一管理消息收发。
     """
     await ws.accept()
+    # 推历史给前端
+    history = await load_recent_messages(limit=50)
+    await ws.send_text(json.dumps({
+        "type": "history",
+        "messages": history,
+    }, ensure_ascii=False))
 
     dispatcher = WSDispatcher(ws)
     confirm_fn = await make_ws_confirm(dispatcher)
@@ -89,11 +138,28 @@ async def ws_chat(
         if content == "/test_tool":
             await run_tool_test(dispatcher, confirm_fn)
             return
+        
+        # 存用户消息
+        await save_message("user", content)
 
-        # 走带工具的对话循环
-        async for chunk in chat_with_tools(client, content, confirm_fn):
+        # 取最近 20 条给模型做上下文
+        #    去掉最后一条（刚存的用户消息），因为 chat_with_tools 会自己加
+        history = await load_recent_messages(limit=20)
+        history = history[:-1]
+
+        # 走带工具的对话循环，边收边推
+        full_reply = ""
+        async for chunk in chat_with_tools(
+            client, content, history=history, confirm_fn=confirm_fn
+        ):
+            full_reply += chunk
             await dispatcher.send({"type": "delta", "content": chunk})
+
         await dispatcher.send({"type": "done"})
+
+        # 存模型回复
+        if full_reply:
+            await save_message("assistant", full_reply)
     
     # 关键：把处理函数挂上，然后启动 dispatcher
     dispatcher.on_chat = handle_chat

@@ -135,7 +135,8 @@ async def handle_tool_call(name: str, arguments: str, confirm_fn) -> str:
 async def chat_with_tools(
     client: AsyncOpenAI,
     user_message: str,
-    confirm_fn,
+    history: list[dict] | None = None,
+    confirm_fn=None,
     max_rounds: int = 5,
 ):
     """
@@ -151,8 +152,9 @@ async def chat_with_tools(
         4. 如果模型调了工具 → 执行工具，结果加进历史，回到第 2 步
         5. 最多循环 max_rounds 轮
     """
-    messages = [{"role": "user", "content": user_message}]
-
+    # 先放历史，再放当前这条用户消息
+    messages = list(history or [])
+    messages.append({"role": "user", "content": user_message})
     for _ in range(max_rounds):
         stream = await client.chat.completions.create(
             model=settings.deepseek_model,

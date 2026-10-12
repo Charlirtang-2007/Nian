@@ -58,6 +58,13 @@ function connectWS() {
         currentReply.value = ''
       }
       scrollToBottom()
+    } else if (msg.type === 'history') {
+      // 后端推来的历史，替换消息列表
+      messages.value = msg.messages.map(m => ({
+        role: m.role === 'tool' ? 'system' : m.role,
+        content: m.content,
+      }))
+      scrollToBottom()
     } else if (msg.type === 'tool_request') {
       toolDialog.value = {
         id: msg.id,
