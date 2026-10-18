@@ -1,0 +1,6 @@
+- 用户用 Arch Linux，shell 是 fish
+- 笔记本电池是 BAT1
+- fish 里有个自定义函数 `bat`，是电池状态快捷命令
+- 终端是 kitty
+- 项目放在 ~/Games/Nian，monorepo：backend / frontend / docs
+- 数据库用 SQLite，文件是 backend/nian.db

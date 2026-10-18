@@ -11,12 +11,45 @@
   - 工具的实际执行通过 handle_tool_call 转给 guard 处理
 """
 import json
-
+from pathlib import Path
 from openai import AsyncOpenAI
 
 from config import settings
 from tools.guard import guarded_exec
 
+# ============================================================
+# 系统提示：告诉模型它是谁、能干什么、守什么规矩
+# ============================================================
+
+# 基础设定：写死在代码里，不随环境变
+BASE_SYSTEM_PROMPT = """你是 Nian，一个助手型桌宠。
+
+你在用户的 Arch Linux 上运行，可以调用 exec_terminal 工具执行终端命令。
+
+规则：
+- 先确定信息，再思考输出。不确定就问用户。
+- 一切以用户为主，助手只是工具。
+- 只读命令会自动执行，写操作会先问用户，灾难命令会被直接拒绝。
+- 回答简洁自然，不要啰嗦。
+"""
+
+
+def _load_self_md() -> str:
+    """
+    读 self.md，返回内容。
+    文件不存在就返回空字符串，不报错。
+    """
+    path = Path(__file__).parent / "self.md"
+    if not path.exists():
+        return ""
+    return path.read_text(encoding="utf-8").strip()
+
+
+# 实际用的 SYSTEM_PROMPT：基础设定 + self.md
+_self_md = _load_self_md()
+SYSTEM_PROMPT = BASE_SYSTEM_PROMPT
+if _self_md:
+    SYSTEM_PROMPT += "\n\n# 这台机器的环境\n\n" + _self_md
 
 # ============================================================
 # 工具定义：告诉模型它能调用什么
@@ -153,7 +186,8 @@ async def chat_with_tools(
         5. 最多循环 max_rounds 轮
     """
     # 先放历史，再放当前这条用户消息
-    messages = list(history or [])
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    messages.extend(history or [])
     messages.append({"role": "user", "content": user_message})
     for _ in range(max_rounds):
         stream = await client.chat.completions.create(
